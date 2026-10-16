@@ -1,0 +1,67 @@
+name: Build and publish Android APK
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "*.gradle"
+      - "gradle.properties"
+      - ".github/workflows/build-apk.yml"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: rec-apk-release
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Android SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Compile release APK
+        run: gradle --no-daemon --stacktrace :app:assembleRelease
+      - name: Sign and verify APK
+        shell: bash
+        env:
+          REC_KEYSTORE_B64: ${{ secrets.REC_KEYSTORE_B64 }}
+          REC_KEYSTORE_PASSWORD: ${{ secrets.REC_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          if [[ -n "$REC_KEYSTORE_B64" && -n "$REC_KEYSTORE_PASSWORD" ]]; then
+            printf '%s' "$REC_KEYSTORE_B64" | base64 -d > output/release.jks
+            storepass="$REC_KEYSTORE_PASSWORD"
+          else
+            storepass="$(openssl rand -hex 24)"
+            keytool -genkeypair -noprompt -keystore output/release.jks -storetype PKCS12 -alias rec               -keyalg RSA -keysize 3072 -validity 10000               -dname "CN=REC.APK,O=Personal,C=KR" -storepass "$storepass" -keypass "$storepass"
+            echo "::warning::Temporary release key used. For upgrade-compatible future releases, configure REC_KEYSTORE_B64 and REC_KEYSTORE_PASSWORD secrets."
+          fi
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          "$tools/zipalign" -f -p 4 app/build/outputs/apk/release/app-release-unsigned.apk output/aligned.apk
+          "$tools/apksigner" sign --ks output/release.jks --ks-key-alias rec             --ks-pass "pass:$storepass" --key-pass "pass:$storepass"             --out output/REC-v1.0.1.apk output/aligned.apk
+          "$tools/apksigner" verify --verbose --print-certs output/REC-v1.0.1.apk
+          sha256sum output/REC-v1.0.1.apk > output/REC-v1.0.1.apk.sha256
+      - name: Publish directly to GitHub Releases (no Actions artifact)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view v1.0.1 >/dev/null 2>&1; then
+            gh release upload v1.0.1 output/REC-v1.0.1.apk output/REC-v1.0.1.apk.sha256 --clobber
+          else
+            gh release create v1.0.1 output/REC-v1.0.1.apk output/REC-v1.0.1.apk.sha256               --title "REC v1.0.1 · Screen Recorder"               --notes "Android 10+, no audio, 60 FPS target, stop via ongoing notification. Android MediaProjection permission required. Installation has not been tested on a physical device."
+          fi
